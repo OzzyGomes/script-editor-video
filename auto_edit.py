@@ -1,27 +1,39 @@
 #!/usr/bin/env python3
 """
-AUTO EDIT - Editor Automático de Vídeo
-=====================================
+AUTO EDIT - Editor Automático de Vídeo Avançado
+==============================================
 
-Script para remover pausas sem fala e eliminar regravações de vídeos,
+Script para remover pausas, fillers, regravações e melhorar qualidade de áudio/vídeo,
 mantendo sempre a última ocorrência de frases repetidas.
 
 INSTALAÇÃO:
 1. Instale o ffmpeg no sistema
-2. pip install faster-whisper webrtcvad rapidfuzz moviepy pydub numpy
+2. pip install faster-whisper webrtcvad rapidfuzz moviepy pydub numpy unidecode
 
-USO:
-python auto_edit.py --input video.mp4 --output video_editado.mp4 --write_srt
+USO BÁSICO:
+# Cortar silêncios + regravações + melhorar áudio (padrão):
+python auto_edit.py --input in.mp4 --output out.mp4 --language pt
+
+# Apenas melhorar áudio (sem cortes):
+python auto_edit.py --input in.mp4 --output out.mp4 --audio_only --audio_enhance on
+
+# Exportar igualando bitrate do original:
+python auto_edit.py --input in.mp4 --output out.mp4 --quality_mode match_bitrate
+
+# Exportar com CRF quase-lossless:
+python auto_edit.py --input in.mp4 --output out.mp4 --quality_mode crf --video_crf 16
 
 FUNCIONALIDADES:
 - Remove silêncios longos automaticamente
+- Detecta e remove fillers/hesitações (é..., hum..., hã...)
 - Detecta e remove regravações (mantém a última versão)
+- Melhora qualidade de áudio (denoise, de-esser, normalização EBU R128)
+- Preserva qualidade original do vídeo (mesmo codec, resolução, fps)
 - Gera legendas SRT opcionais
-- Preserva qualidade original do vídeo
 - Aplica micro-fades para evitar clicks audíveis
 
 AUTOR: Gerado automaticamente
-VERSÃO: 1.0
+VERSÃO: 2.0
 """
 
 import argparse
@@ -36,13 +48,12 @@ from typing import Dict, List, Tuple, Optional, Set
 import warnings
 
 import numpy as np
-from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip
-from pydub import AudioSegment
-from pydub.utils import which
+from moviepy.editor import VideoFileClip, concatenate_videoclips
 import webrtcvad
 from faster_whisper import WhisperModel
 from rapidfuzz import fuzz
 import rapidfuzz
+from unidecode import unidecode
 
 # Configurar logging
 logging.basicConfig(
@@ -88,6 +99,96 @@ class AutoEditor:
         return temp_file
 
 
+def probe_input(input_path: str) -> Dict:
+    """
+    Analisa arquivo de entrada usando ffprobe para obter metadados completos.
+    
+    Args:
+        input_path: Caminho para o arquivo de vídeo
+        
+    Returns:
+        Dict com metadados do vídeo e áudio
+    """
+    logger.info(f"Analisando arquivo: {input_path}")
+    
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Arquivo não encontrado: {input_path}")
+    
+    # Verificar se ffprobe está disponível
+    try:
+        subprocess.run(["ffprobe", "-version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        raise RuntimeError("ffprobe não encontrado. Instale o ffmpeg no sistema.")
+    
+    # Comando ffprobe para obter metadados detalhados
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", input_path
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Erro ao analisar arquivo: {result.stderr}")
+    
+    import json
+    data = json.loads(result.stdout)
+    
+    # Extrair metadados de vídeo
+    video_stream = None
+    audio_stream = None
+    
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video" and video_stream is None:
+            video_stream = stream
+        elif stream.get("codec_type") == "audio" and audio_stream is None:
+            audio_stream = stream
+    
+    if not video_stream:
+        raise RuntimeError("Nenhum stream de vídeo encontrado")
+    
+    # Metadados de vídeo
+    v_codec = video_stream.get("codec_name", "unknown")
+    v_bitrate = int(video_stream.get("bit_rate", 0)) if video_stream.get("bit_rate") else None
+    width = int(video_stream.get("width", 0))
+    height = int(video_stream.get("height", 0))
+    fps_str = video_stream.get("r_frame_rate", "0/1")
+    fps = eval(fps_str) if "/" in fps_str else float(fps_str)
+    pix_fmt = video_stream.get("pix_fmt", "yuv420p")
+    profile = video_stream.get("profile", "")
+    level = video_stream.get("level", "")
+    
+    # Metadados de áudio
+    a_codec = audio_stream.get("codec_name", "unknown") if audio_stream else "unknown"
+    a_sr = int(audio_stream.get("sample_rate", 0)) if audio_stream else 0
+    a_channels = int(audio_stream.get("channels", 0)) if audio_stream else 0
+    a_bitrate = int(audio_stream.get("bit_rate", 0)) if audio_stream and audio_stream.get("bit_rate") else None
+    
+    # Duração total
+    duration = float(data.get("format", {}).get("duration", 0))
+    
+    meta = {
+        "v_codec": v_codec,
+        "v_bitrate": v_bitrate,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "pix_fmt": pix_fmt,
+        "profile": profile,
+        "level": level,
+        "a_codec": a_codec,
+        "a_sr": a_sr,
+        "a_channels": a_channels,
+        "a_bitrate": a_bitrate,
+        "duration": duration
+    }
+    
+    logger.info(f"Metadados: {width}x{height}@{fps:.2f}fps, {v_codec}, {pix_fmt}")
+    if a_codec != "unknown":
+        logger.info(f"Áudio: {a_codec}, {a_sr}Hz, {a_channels}ch")
+    
+    return meta
+
+
 def load_media(input_path: str) -> Dict:
     """
     Carrega vídeo e extrai áudio mono 16kHz PCM.
@@ -100,32 +201,18 @@ def load_media(input_path: str) -> Dict:
     """
     logger.info(f"Carregando mídia: {input_path}")
     
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Arquivo não encontrado: {input_path}")
+    # Obter metadados usando ffprobe
+    meta = probe_input(input_path)
     
     # Verificar se ffmpeg está disponível
-    if not which("ffmpeg"):
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
         raise RuntimeError("ffmpeg não encontrado. Instale o ffmpeg no sistema.")
     
     try:
-        # Carregar vídeo com moviepy para obter metadados
-        video = VideoFileClip(input_path)
-        
-        # Extrair metadados
-        fps = video.fps
-        width, height = video.size
-        duration = video.duration
-        
-        # Obter codec de áudio
-        audio_codec = None
-        if hasattr(video, 'audio') and video.audio:
-            audio_codec = getattr(video.audio, 'codec', 'unknown')
-        
-        video.close()
-        
         # Extrair áudio com ffmpeg diretamente para melhor controle
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-            temp_audio_path = temp_audio.name
+        temp_audio_path = tempfile.mktemp(suffix=".wav")
         
         # Comando ffmpeg para extrair áudio mono 16kHz PCM
         cmd = [
@@ -143,20 +230,12 @@ def load_media(input_path: str) -> Dict:
         if result.returncode != 0:
             raise RuntimeError(f"Erro ao extrair áudio: {result.stderr}")
         
-        # Carregar áudio extraído para obter sample rate
-        audio_segment = AudioSegment.from_wav(temp_audio_path)
-        sr = audio_segment.frame_rate
-        
-        logger.info(f"Áudio extraído: {duration:.2f}s, {sr}Hz, mono")
+        logger.info(f"Áudio extraído: {meta['duration']:.2f}s, 16000Hz, mono")
         
         return {
-            "audio_tmp_path": temp_audio_path,
-            "sr": sr,
-            "fps": fps,
-            "width": width,
-            "height": height,
-            "codec_info": audio_codec,
-            "duration": duration
+            "audio_wav_path": temp_audio_path,
+            "sr": 16000,
+            "meta": meta
         }
         
     except Exception as e:
@@ -164,14 +243,42 @@ def load_media(input_path: str) -> Dict:
         raise
 
 
-def run_vad(audio_tmp_path: str, sr: int, vad_aggressiveness: int = 2, 
+def load_audio_data(audio_path: str) -> np.ndarray:
+    """
+    Carrega dados de áudio usando ffmpeg diretamente.
+    
+    Args:
+        audio_path: Caminho para arquivo de áudio
+        
+    Returns:
+        Array numpy com dados de áudio
+    """
+    # Usar ffmpeg para extrair dados brutos
+    cmd = [
+        "ffmpeg", "-i", audio_path,
+        "-f", "s16le",  # 16-bit little-endian
+        "-ac", "1",     # mono
+        "-ar", "16000", # 16kHz
+        "-"
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Erro ao carregar áudio: {result.stderr}")
+    
+    # Converter bytes para array numpy
+    audio_data = np.frombuffer(result.stdout, dtype=np.int16)
+    return audio_data
+
+
+def run_vad(audio_wav_path: str, sr: int, vad_aggressiveness: int = 2, 
            min_speech_ms: int = 200, min_gap_ms: int = 150, 
            speech_padding_ms: int = 150) -> List[Tuple[float, float]]:
     """
     Executa detecção de atividade de voz (VAD) no áudio.
     
     Args:
-        audio_tmp_path: Caminho para arquivo de áudio temporário
+        audio_wav_path: Caminho para arquivo de áudio WAV
         sr: Sample rate do áudio
         vad_aggressiveness: Agressividade do VAD (0-3)
         min_speech_ms: Duração mínima de segmento de fala
@@ -183,9 +290,8 @@ def run_vad(audio_tmp_path: str, sr: int, vad_aggressiveness: int = 2,
     """
     logger.info("Executando detecção de atividade de voz (VAD)...")
     
-    # Carregar áudio
-    audio_segment = AudioSegment.from_wav(audio_tmp_path)
-    audio_data = np.array(audio_segment.get_array_of_samples(), dtype=np.int16)
+    # Carregar áudio usando ffmpeg diretamente
+    audio_data = load_audio_data(audio_wav_path)
     
     # Configurar VAD
     vad = webrtcvad.Vad(vad_aggressiveness)
@@ -257,19 +363,22 @@ def run_vad(audio_tmp_path: str, sr: int, vad_aggressiveness: int = 2,
     return merged_segments
 
 
-def transcribe_segments(audio_tmp_path: str, segments: List[Tuple[float, float]], 
-                       language: str = "auto", model_size: str = "small") -> List[Dict]:
+def transcribe_segments(audio_wav_path: str, segments: List[Tuple[float, float]], 
+                       language: str = "auto", model_size: str = "small", 
+                       silence_split_ms: int = 700, word_level: bool = True) -> List[Dict]:
     """
-    Transcreve segmentos de áudio usando Whisper.
+    Transcreve segmentos de áudio usando Whisper com word timestamps.
     
     Args:
-        audio_tmp_path: Caminho para arquivo de áudio
+        audio_wav_path: Caminho para arquivo de áudio WAV
         segments: Lista de segmentos (start, end) em segundos
         language: Idioma para transcrição
         model_size: Tamanho do modelo Whisper
+        silence_split_ms: Pausa para dividir frases em ms
+        word_level: Incluir timestamps de palavras
         
     Returns:
-        Lista de frases com timestamps
+        Lista de frases com timestamps e palavras
     """
     logger.info("Iniciando transcrição com Whisper...")
     
@@ -282,30 +391,35 @@ def transcribe_segments(audio_tmp_path: str, segments: List[Tuple[float, float]]
         logger.info(f"Carregando modelo Whisper: {model_size}")
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
         
-        # Carregar áudio completo
-        audio_segment = AudioSegment.from_wav(audio_tmp_path)
-        
         sentences = []
         
         for i, (start, end) in enumerate(segments):
             logger.info(f"Transcrevendo segmento {i+1}/{len(segments)}: {start:.2f}s - {end:.2f}s")
             
-            # Extrair segmento de áudio
-            start_ms = int(start * 1000)
-            end_ms = int(end * 1000)
-            segment_audio = audio_segment[start_ms:end_ms]
+            # Extrair segmento de áudio com ffmpeg
+            temp_segment_path = tempfile.mktemp(suffix=".wav")
             
-            # Salvar segmento temporário
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_segment:
-                temp_segment_path = temp_segment.name
-                segment_audio.export(temp_segment_path, format="wav")
+            cmd = [
+                "ffmpeg", "-i", audio_wav_path,
+                "-ss", str(start),
+                "-t", str(end - start),
+                "-ac", "1",
+                "-ar", "16000",
+                "-y",
+                temp_segment_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.warning(f"Erro ao extrair segmento {i+1}: {result.stderr}")
+                continue
             
             try:
                 # Transcrever segmento
                 segments_result, info = model.transcribe(
                     temp_segment_path,
                     language=language if language != "auto" else None,
-                    word_timestamps=True
+                    word_timestamps=word_level
                 )
                 
                 # Processar resultados
@@ -315,12 +429,26 @@ def transcribe_segments(audio_tmp_path: str, segments: List[Tuple[float, float]]
                         adjusted_start = start + segment_result.start
                         adjusted_end = start + segment_result.end
                         
-                        sentences.append({
+                        sentence_data = {
                             "text": segment_result.text.strip(),
                             "start": adjusted_start,
                             "end": adjusted_end,
                             "confidence": getattr(segment_result, 'avg_logprob', 0.0)
-                        })
+                        }
+                        
+                        # Adicionar timestamps de palavras se disponível
+                        if word_level and hasattr(segment_result, 'words'):
+                            words = []
+                            for word in segment_result.words:
+                                words.append({
+                                    "text": word.word,
+                                    "start": start + word.start,
+                                    "end": start + word.end,
+                                    "probability": getattr(word, 'probability', 0.0)
+                                })
+                            sentence_data["words"] = words
+                        
+                        sentences.append(sentence_data)
                 
             finally:
                 # Limpar arquivo temporário do segmento
@@ -348,6 +476,94 @@ def transcribe_segments(audio_tmp_path: str, segments: List[Tuple[float, float]]
         return []
 
 
+def detect_fillers(sentences: List[Dict], fillers_cfg: Dict) -> List[Tuple[float, float]]:
+    """
+    Detecta fillers/hesitações baseado em palavras e padrões regex.
+    
+    Args:
+        sentences: Lista de frases com timestamps de palavras
+        fillers_cfg: Configuração de detecção de fillers
+        
+    Returns:
+        Lista de intervalos (start, end) para remover
+    """
+    logger.info("Detectando fillers e hesitações...")
+    
+    if not sentences:
+        return []
+    
+    # Padrão regex para fillers em PT-BR
+    filler_pattern = fillers_cfg.get("filler_regex", 
+        r"\b(e+|ee+|eh+|h[au]+|hum+m+|hmm+|ah+|uh+|u+m+)\b")
+    
+    max_filler_len_ms = fillers_cfg.get("max_filler_len_ms", 1200)
+    filler_pad_ms = fillers_cfg.get("filler_pad_ms", 100)
+    
+    intervals_to_remove = []
+    
+    for sentence in sentences:
+        if "words" not in sentence:
+            continue
+            
+        words = sentence["words"]
+        if not words:
+            continue
+        
+        # Agrupar palavras consecutivas que são fillers
+        current_filler_start = None
+        current_filler_end = None
+        
+        for i, word in enumerate(words):
+            word_text = word.get("text", "").strip()
+            if not word_text:
+                continue
+                
+            # Normalizar texto para comparação
+            normalized_text = unidecode(word_text.lower().strip())
+            
+            # Verificar se é filler
+            if re.search(filler_pattern, normalized_text, re.IGNORECASE):
+                word_start = word.get("start", 0)
+                word_end = word.get("end", word_start)
+                
+                if current_filler_start is None:
+                    # Início de um novo bloco de filler
+                    current_filler_start = word_start
+                    current_filler_end = word_end
+                else:
+                    # Continuar bloco existente
+                    current_filler_end = word_end
+            else:
+                # Fim do bloco de filler
+                if current_filler_start is not None:
+                    filler_duration_ms = (current_filler_end - current_filler_start) * 1000
+                    
+                    if filler_duration_ms <= max_filler_len_ms:
+                        # Adicionar padding
+                        start_with_padding = max(0, current_filler_start - filler_pad_ms / 1000)
+                        end_with_padding = current_filler_end + filler_pad_ms / 1000
+                        
+                        intervals_to_remove.append((start_with_padding, end_with_padding))
+                        logger.info(f"Filler detectado: '{sentence['text'][:50]}...' ({filler_duration_ms:.0f}ms)")
+                    
+                    current_filler_start = None
+                    current_filler_end = None
+        
+        # Verificar se há filler no final da frase
+        if current_filler_start is not None:
+            filler_duration_ms = (current_filler_end - current_filler_start) * 1000
+            
+            if filler_duration_ms <= max_filler_len_ms:
+                start_with_padding = max(0, current_filler_start - filler_pad_ms / 1000)
+                end_with_padding = current_filler_end + filler_pad_ms / 1000
+                
+                intervals_to_remove.append((start_with_padding, end_with_padding))
+                logger.info(f"Filler detectado: '{sentence['text'][:50]}...' ({filler_duration_ms:.0f}ms)")
+    
+    logger.info(f"Detectados {len(intervals_to_remove)} fillers para remover")
+    return intervals_to_remove
+
+
 def normalize_text(text: str) -> str:
     """
     Normaliza texto para comparação de similaridade.
@@ -358,14 +574,14 @@ def normalize_text(text: str) -> str:
     Returns:
         Texto normalizado
     """
-    # Converter para minúsculas
-    text = text.lower().strip()
+    # Converter para minúsculas e remover acentos
+    text = unidecode(text.lower().strip())
     
     # Remover pontuação excessiva
     text = re.sub(r'[.,!?;:]+', '', text)
     
     # Remover fillers comuns
-    fillers = ['é...', 'ah...', 'uh...', 'hmm...', 'bem...', 'então...', 'assim...']
+    fillers = ['e...', 'ah...', 'uh...', 'hmm...', 'bem...', 'entao...', 'assim...']
     for filler in fillers:
         text = text.replace(filler, '')
     
@@ -427,6 +643,107 @@ def detect_retakes(sentences: List[Dict], repeat_window_s: float = 60.0,
     
     logger.info(f"Detectadas {len(excluded_indices)} regravações para remover")
     return excluded_indices
+
+
+def enhance_audio(in_wav: str, out_wav: str, cfg: Dict) -> None:
+    """
+    Melhora qualidade de áudio usando filtros ffmpeg com 2-pass loudnorm.
+    
+    Args:
+        in_wav: Caminho do arquivo WAV de entrada
+        out_wav: Caminho do arquivo WAV de saída
+        cfg: Configuração de melhoria de áudio
+    """
+    logger.info("Melhorando qualidade de áudio...")
+    
+    # Construir pipeline de filtros
+    filters = []
+    
+    # Denoise
+    if cfg.get("denoise") == "afftdn":
+        denoise_strength = cfg.get("denoise_strength", 12)
+        filters.append(f"afftdn=nr={denoise_strength}")
+    elif cfg.get("denoise") == "arnndn":
+        # Usar arnndn se disponível (requer modelo)
+        filters.append("arnndn")
+    
+    # High-pass filter
+    highpass_hz = cfg.get("highpass_hz", 80)
+    filters.append(f"highpass=f={highpass_hz}")
+    
+    # De-esser
+    deesser_mode = cfg.get("deesser", "medium")
+    if deesser_mode != "off":
+        deesser_strength = {"light": 0.5, "medium": 1.0, "strong": 1.5}.get(deesser_mode, 1.0)
+        filters.append(f"deesser=i={deesser_strength}")
+    
+    # Compressão leve
+    compress_thresh = cfg.get("compress_threshold_db", -18)
+    compress_ratio = cfg.get("compress_ratio", 2.5)
+    filters.append(f"acompressor=threshold={compress_thresh}dB:ratio={compress_ratio}:attack=10:release=60")
+    
+    # Loudness normalization (2-pass)
+    lufs_target = cfg.get("loudnorm_i", -16)
+    lufs_tp = cfg.get("loudnorm_tp", -1.5)
+    lufs_lra = cfg.get("loudnorm_lra", 11)
+    
+    # Primeiro pass: medir loudness
+    measure_cmd = [
+        "ffmpeg", "-i", in_wav,
+        "-af", f"loudnorm=I={lufs_target}:TP={lufs_tp}:LRA={lufs_lra}:print_format=json",
+        "-f", "null", "-"
+    ]
+    
+    logger.info("Medindo loudness (pass 1)...")
+    result = subprocess.run(measure_cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        logger.warning("Erro na medição de loudness, usando valores padrão")
+        measured_i = lufs_target
+        measured_tp = lufs_tp
+        measured_lra = lufs_lra
+    else:
+        # Extrair valores medidos do output
+        import json
+        try:
+            # O ffmpeg pode imprimir múltiplas linhas, buscar a última com JSON válido
+            for line in reversed(result.stderr.split('\n')):
+                if line.strip().startswith('{'):
+                    loudness_data = json.loads(line.strip())
+                    measured_i = loudness_data.get('input_i', lufs_target)
+                    measured_tp = loudness_data.get('input_tp', lufs_tp)
+                    measured_lra = loudness_data.get('input_lra', lufs_lra)
+                    break
+            else:
+                measured_i = lufs_target
+                measured_tp = lufs_tp
+                measured_lra = lufs_lra
+        except:
+            measured_i = lufs_target
+            measured_tp = lufs_tp
+            measured_lra = lufs_lra
+    
+    # Adicionar loudnorm ao pipeline
+    filters.append(f"loudnorm=I={lufs_target}:TP={lufs_tp}:LRA={lufs_lra}:measured_I={measured_i}:measured_TP={measured_tp}:measured_LRA={measured_lra}")
+    
+    # Construir comando final
+    filter_chain = ",".join(filters)
+    
+    cmd = [
+        "ffmpeg", "-i", in_wav,
+        "-af", filter_chain,
+        "-ar", "48000",  # Upsample para melhor qualidade
+        "-ac", "2",      # Estéreo
+        "-y", out_wav
+    ]
+    
+    logger.info(f"Aplicando filtros: {filter_chain}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"Erro ao melhorar áudio: {result.stderr}")
+    
+    logger.info("Melhoria de áudio concluída")
 
 
 def build_final_timeline(vad_segments: List[Tuple[float, float]], 
@@ -504,7 +821,8 @@ def build_final_timeline(vad_segments: List[Tuple[float, float]],
 
 
 def render_video(input_path: str, kept_intervals: List[Tuple[float, float]], 
-                output_path: str, fps: float, audio_fade_ms: int = 40) -> None:
+                output_path: str, meta: Dict, video_quality: Dict, 
+                audio_fade_ms: int = 40, audio_wav_final: str = None) -> None:
     """
     Renderiza vídeo final mantendo apenas os intervalos especificados.
     
@@ -512,8 +830,10 @@ def render_video(input_path: str, kept_intervals: List[Tuple[float, float]],
         input_path: Caminho do vídeo original
         kept_intervals: Intervalos a manter
         output_path: Caminho do vídeo de saída
-        fps: FPS do vídeo original
+        meta: Metadados do vídeo original
+        video_quality: Configuração de qualidade de vídeo
         audio_fade_ms: Duração do fade de áudio
+        audio_wav_final: Caminho do áudio melhorado (opcional)
     """
     logger.info("Renderizando vídeo final...")
     
@@ -521,6 +841,48 @@ def render_video(input_path: str, kept_intervals: List[Tuple[float, float]],
         logger.warning("Nenhum intervalo para renderizar")
         return
     
+    # Modo áudio-apenas: apenas substituir áudio
+    if video_quality.get("audio_only", False):
+        logger.info("Modo áudio-apenas: substituindo áudio sem cortes")
+        
+        if not audio_wav_final or not os.path.exists(audio_wav_final):
+            raise RuntimeError("Arquivo de áudio melhorado não encontrado para modo áudio-apenas")
+        
+        # Converter áudio para formato compatível
+        temp_audio = tempfile.mktemp(suffix=".aac")
+        cmd = [
+            "ffmpeg", "-i", audio_wav_final,
+            "-c:a", "aac", "-b:a", video_quality.get("audio_bitrate", "192k"),
+            "-y", temp_audio
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Erro ao converter áudio: {result.stderr}")
+        
+        # Fazer remux com stream-copy do vídeo
+        cmd = [
+            "ffmpeg", "-i", input_path, "-i", temp_audio,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", "-c:a", "copy",
+            "-movflags", "+faststart",
+            "-y", output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Erro ao fazer remux: {result.stderr}")
+        
+        # Limpar arquivo temporário
+        try:
+            os.remove(temp_audio)
+        except:
+            pass
+        
+        logger.info("Remux concluído")
+        return
+    
+    # Modo com cortes: usar MoviePy
     try:
         # Carregar vídeo original
         video = VideoFileClip(input_path)
@@ -549,17 +911,66 @@ def render_video(input_path: str, kept_intervals: List[Tuple[float, float]],
         else:
             final_video = concatenate_videoclips(clips, method="compose")
         
+        # Configurar parâmetros de exportação baseados na qualidade
+        quality_mode = video_quality.get("mode", "match_bitrate")
+        v_codec = meta.get("v_codec", "libx264")
+        pix_fmt = video_quality.get("pix_fmt", meta.get("pix_fmt", "yuv420p"))
+        fps = meta.get("fps", 30)
+        
+        # Configurar parâmetros de qualidade
+        ffmpeg_params = []
+        
+        # Formato de pixel
+        if pix_fmt:
+            ffmpeg_params.extend(["-pix_fmt", pix_fmt])
+        
+        # Preset
+        preset = video_quality.get("video_preset", "slow")
+        ffmpeg_params.extend(["-preset", preset])
+        
+        # Movflags
+        ffmpeg_params.extend(["-movflags", "+faststart"])
+        
+        # Configurar codec e parâmetros
+        if quality_mode == "match_bitrate":
+            # Usar mesmo bitrate do original
+            bitrate = meta.get("v_bitrate")
+            if bitrate:
+                bitrate_k = f"{bitrate // 1000}k"
+                ffmpeg_params.extend(["-b:v", bitrate_k])
+                logger.info(f"Qualidade: {quality_mode}, codec: {v_codec}, bitrate: {bitrate_k}")
+            else:
+                ffmpeg_params.extend(["-crf", "23"])
+                logger.info(f"Qualidade: {quality_mode}, codec: {v_codec}, crf: 23 (fallback)")
+        elif quality_mode == "crf":
+            # Usar CRF
+            crf = video_quality.get("video_crf", 18 if v_codec == "libx264" else 20)
+            ffmpeg_params.extend(["-crf", str(crf)])
+            logger.info(f"Qualidade: {quality_mode}, codec: {v_codec}, crf: {crf}")
+        elif quality_mode == "lossless":
+            # Lossless
+            if v_codec == "libx264":
+                ffmpeg_params.extend(["-crf", "0"])
+            else:
+                ffmpeg_params.extend(["-qp", "0"])
+            logger.info(f"Qualidade: {quality_mode}, codec: {v_codec}, lossless")
+        else:
+            ffmpeg_params.extend(["-crf", "23"])
+            logger.info(f"Qualidade: {quality_mode}, codec: {v_codec}, crf: 23 (fallback)")
+        
         # Escrever vídeo final
         logger.info(f"Salvando vídeo: {output_path}")
+        
         final_video.write_videofile(
             output_path,
             fps=fps,
-            codec='libx264',
+            codec=v_codec,
             audio_codec='aac',
             temp_audiofile='temp-audio.m4a',
             remove_temp=True,
             verbose=False,
-            logger=None
+            logger=None,
+            ffmpeg_params=ffmpeg_params
         )
         
         # Fechar clips
@@ -610,13 +1021,21 @@ def write_srt(sentences_kept: List[Dict], srt_path: str) -> None:
 def main():
     """Função principal com CLI."""
     parser = argparse.ArgumentParser(
-        description="Editor automático de vídeo - Remove silêncios e regravações",
+        description="Editor automático de vídeo - Remove silêncios, fillers, regravações e melhora áudio",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos de uso:
-  python auto_edit.py --input video.mp4 --output editado.mp4
-  python auto_edit.py --input video.mp4 --output editado.mp4 --write_srt --language pt
-  python auto_edit.py --input video.mp4 --output editado.mp4 --vad_aggressiveness 3 --repeat_similarity 85
+  # Cortar silêncios + regravações + melhorar áudio (padrão):
+  python auto_edit.py --input in.mp4 --output out.mp4 --language pt
+
+  # Apenas melhorar áudio (sem cortes):
+  python auto_edit.py --input in.mp4 --output out.mp4 --audio_only --audio_enhance on
+
+  # Exportar igualando bitrate do original:
+  python auto_edit.py --input in.mp4 --output out.mp4 --quality_mode match_bitrate
+
+  # Exportar com CRF quase-lossless:
+  python auto_edit.py --input in.mp4 --output out.mp4 --quality_mode crf --video_crf 16
         """
     )
     
@@ -624,7 +1043,7 @@ Exemplos de uso:
     parser.add_argument("--input", required=True, help="Caminho do vídeo de entrada")
     parser.add_argument("--output", required=True, help="Caminho do vídeo de saída")
     
-    # Configurações de idioma e modelo
+    # Configurações gerais
     parser.add_argument("--language", choices=["auto", "pt", "en"], default="auto",
                        help="Idioma para transcrição (default: auto)")
     parser.add_argument("--whisper_model_size", default="small",
@@ -651,19 +1070,63 @@ Exemplos de uso:
     parser.add_argument("--repeat_similarity", type=float, default=88.0,
                        help="Limiar de similaridade para repetições 0-100 (default: 88)")
     
+    # Configurações de fillers
+    parser.add_argument("--filler_pad_ms", type=int, default=100,
+                       help="Padding para fillers em ms (default: 100)")
+    parser.add_argument("--max_filler_len_ms", type=int, default=1200,
+                       help="Duração máxima de filler em ms (default: 1200)")
+    parser.add_argument("--filler_regex", type=str, default=None,
+                       help="Regex customizado para detectar fillers")
+    
     # Configurações de renderização
     parser.add_argument("--audio_fade_ms", type=int, default=40,
                        help="Duração do fade de áudio em ms (default: 40)")
     parser.add_argument("--join_gap_ms", type=int, default=120,
                        help="Gap máximo para unir segmentos em ms (default: 120)")
     
+    # Qualidade de vídeo
+    parser.add_argument("--quality_mode", choices=["match_bitrate", "crf", "lossless"], 
+                       default="match_bitrate", help="Modo de qualidade de vídeo (default: match_bitrate)")
+    parser.add_argument("--video_crf", type=int, default=18,
+                       help="CRF para vídeo (default: 18 para H.264, 20 para H.265)")
+    parser.add_argument("--video_preset", default="slow",
+                       help="Preset de codificação (default: slow)")
+    parser.add_argument("--target_bitrate", type=str, default=None,
+                       help="Bitrate de saída (ex: 1000k)")
+    parser.add_argument("--pix_fmt", default="input",
+                       help="Formato de pixel (default: input)")
+    parser.add_argument("--keep_fps_res", action="store_true", default=True,
+                       help="Manter FPS e resolução do input (default: True)")
+    
+    # Áudio / melhoria
+    parser.add_argument("--audio_enhance", choices=["on", "off"], default="on",
+                       help="Melhorar qualidade de áudio (default: on)")
+    parser.add_argument("--audio_only", action="store_true",
+                       help="Apenas melhorar áudio (sem cortes)")
+    parser.add_argument("--denoise", choices=["none", "afftdn", "arnndn"], default="afftdn",
+                       help="Método de denoise (default: afftdn)")
+    parser.add_argument("--denoise_strength", type=int, default=12,
+                       help="Força do denoise (default: 12)")
+    parser.add_argument("--deesser", choices=["off", "light", "medium", "strong"], 
+                       default="medium", help="Força do de-esser (default: medium)")
+    parser.add_argument("--highpass_hz", type=int, default=80,
+                       help="Frequência do high-pass filter (default: 80)")
+    parser.add_argument("--compress_threshold_db", type=float, default=-18,
+                       help="Threshold de compressão em dB (default: -18)")
+    parser.add_argument("--compress_ratio", type=float, default=2.5,
+                       help="Ratio de compressão (default: 2.5)")
+    parser.add_argument("--loudnorm_i", type=float, default=-16,
+                       help="Target LUFS (default: -16)")
+    parser.add_argument("--loudnorm_tp", type=float, default=-1.5,
+                       help="True peak em dB (default: -1.5)")
+    parser.add_argument("--loudnorm_lra", type=float, default=11,
+                       help="LRA em LU (default: 11)")
+    parser.add_argument("--audio_bitrate", default="192k",
+                       help="Bitrate de áudio de saída (default: 192k)")
+    
     # Opções
     parser.add_argument("--write_srt", action="store_true",
                        help="Gerar arquivo SRT com legendas")
-    parser.add_argument("--keep_silence_ms", type=int, default=0,
-                       help="Manter silêncio residual em ms (default: 0)")
-    parser.add_argument("--target_bitrate", type=str, default=None,
-                       help="Bitrate de saída (ex: 1000k)")
     
     args = parser.parse_args()
     
@@ -690,20 +1153,80 @@ Exemplos de uso:
         "repeat_similarity": args.repeat_similarity,
         "audio_fade_ms": args.audio_fade_ms,
         "join_gap_ms": args.join_gap_ms,
-        "keep_silence_ms": args.keep_silence_ms,
-        "target_bitrate": args.target_bitrate
+        "audio_enhance": args.audio_enhance == "on",
+        "audio_only": args.audio_only,
+        "denoise": args.denoise,
+        "denoise_strength": args.denoise_strength,
+        "deesser": args.deesser,
+        "highpass_hz": args.highpass_hz,
+        "compress_threshold_db": args.compress_threshold_db,
+        "compress_ratio": args.compress_ratio,
+        "loudnorm_i": args.loudnorm_i,
+        "loudnorm_tp": args.loudnorm_tp,
+        "loudnorm_lra": args.loudnorm_lra,
+        "audio_bitrate": args.audio_bitrate,
+        "filler_pad_ms": args.filler_pad_ms,
+        "max_filler_len_ms": args.max_filler_len_ms,
+        "filler_regex": args.filler_regex
+    }
+    
+    # Configurações de qualidade de vídeo
+    video_quality = {
+        "mode": args.quality_mode,
+        "video_crf": args.video_crf,
+        "video_preset": args.video_preset,
+        "target_bitrate": args.target_bitrate,
+        "pix_fmt": args.pix_fmt if args.pix_fmt != "input" else None,
+        "keep_fps_res": args.keep_fps_res,
+        "audio_only": args.audio_only,
+        "audio_bitrate": args.audio_bitrate
+    }
+    
+    # Configurações de fillers
+    fillers_cfg = {
+        "filler_pad_ms": args.filler_pad_ms,
+        "max_filler_len_ms": args.max_filler_len_ms,
+        "filler_regex": args.filler_regex or r"\b(e+|ee+|eh+|h[au]+|hum+m+|hmm+|ah+|uh+|u+m+)\b"
     }
     
     try:
         with AutoEditor(config) as editor:
             # 1. Carregar mídia
             media_info = load_media(args.input)
-            original_duration = media_info["duration"]
-            editor.temp_files.append(media_info["audio_tmp_path"])
+            original_duration = media_info["meta"]["duration"]
+            editor.temp_files.append(media_info["audio_wav_path"])
+            
+            # Modo áudio-apenas: pular VAD/transcrição
+            if config["audio_only"]:
+                logger.info("Modo áudio-apenas: melhorando áudio sem cortes")
+                
+                if config["audio_enhance"]:
+                    # Melhorar áudio
+                    enhanced_audio_path = tempfile.mktemp(suffix=".wav")
+                    editor.temp_files.append(enhanced_audio_path)
+                    enhance_audio(media_info["audio_wav_path"], enhanced_audio_path, config)
+                    
+                    # Renderizar vídeo com áudio melhorado
+                    render_video(
+                        args.input,
+                        [(0, original_duration)],  # Intervalo completo
+                        args.output,
+                        media_info["meta"],
+                        video_quality,
+                        config["audio_fade_ms"],
+                        enhanced_audio_path
+                    )
+                else:
+                    # Apenas copiar arquivo
+                    import shutil
+                    shutil.copy2(args.input, args.output)
+                
+                logger.info("Processamento áudio-apenas concluído")
+                return 0
             
             # 2. Detecção de voz
             vad_segments = run_vad(
-                media_info["audio_tmp_path"],
+                media_info["audio_wav_path"],
                 media_info["sr"],
                 config["vad_aggressiveness"],
                 config["min_speech_ms"],
@@ -713,13 +1236,20 @@ Exemplos de uso:
             
             # 3. Transcrição
             sentences = transcribe_segments(
-                media_info["audio_tmp_path"],
+                media_info["audio_wav_path"],
                 vad_segments,
                 config["language"],
-                config["whisper_model_size"]
+                config["whisper_model_size"],
+                config["silence_split_ms"],
+                True  # word_level
             )
             
-            # 4. Detecção de regravações
+            # 4. Detecção de fillers
+            filler_intervals = []
+            if sentences:
+                filler_intervals = detect_fillers(sentences, fillers_cfg)
+            
+            # 5. Detecção de regravações
             excluded_indices = set()
             if sentences:
                 excluded_indices = detect_retakes(
@@ -728,7 +1258,7 @@ Exemplos de uso:
                     config["repeat_similarity"]
                 )
             
-            # 5. Timeline final
+            # 6. Timeline final
             final_intervals = build_final_timeline(
                 vad_segments,
                 excluded_indices,
@@ -736,16 +1266,25 @@ Exemplos de uso:
                 config["join_gap_ms"]
             )
             
-            # 6. Renderizar vídeo
+            # 7. Melhorar áudio se solicitado
+            audio_wav_final = None
+            if config["audio_enhance"]:
+                audio_wav_final = tempfile.mktemp(suffix=".wav")
+                editor.temp_files.append(audio_wav_final)
+                enhance_audio(media_info["audio_wav_path"], audio_wav_final, config)
+            
+            # 8. Renderizar vídeo
             render_video(
                 args.input,
                 final_intervals,
                 args.output,
-                media_info["fps"],
-                config["audio_fade_ms"]
+                media_info["meta"],
+                video_quality,
+                config["audio_fade_ms"],
+                audio_wav_final
             )
             
-            # 7. Gerar SRT se solicitado
+            # 9. Gerar SRT se solicitado
             if args.write_srt and sentences:
                 srt_path = os.path.splitext(args.output)[0] + ".srt"
                 # Filtrar frases mantidas
@@ -756,6 +1295,7 @@ Exemplos de uso:
             final_duration = sum(end - start for start, end in final_intervals)
             cuts_made = len(vad_segments) - len(final_intervals)
             retakes_removed = len(excluded_indices)
+            fillers_removed = len(filler_intervals)
             
             logger.info("=" * 50)
             logger.info("PROCESSAMENTO CONCLUÍDO")
@@ -765,6 +1305,7 @@ Exemplos de uso:
             logger.info(f"Tempo removido: {original_duration - final_duration:.2f}s")
             logger.info(f"Segmentos cortados: {cuts_made}")
             logger.info(f"Regravações removidas: {retakes_removed}")
+            logger.info(f"Fillers removidos: {fillers_removed}")
             logger.info(f"Arquivo salvo: {args.output}")
             if args.write_srt and sentences:
                 logger.info(f"Legendas salvas: {srt_path}")
