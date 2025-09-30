@@ -48,7 +48,6 @@ from typing import Dict, List, Tuple, Optional, Set
 import warnings
 
 import numpy as np
-from moviepy.editor import VideoFileClip, concatenate_videoclips
 import webrtcvad
 from faster_whisper import WhisperModel
 from rapidfuzz import fuzz
@@ -884,6 +883,8 @@ def render_video(input_path: str, kept_intervals: List[Tuple[float, float]],
     
     # Modo com cortes: usar MoviePy
     try:
+        # Importar MoviePy apenas quando necessário (evita dependência para modos sem renderização)
+        from moviepy import VideoFileClip, concatenate_videoclips
         # Carregar vídeo original
         video = VideoFileClip(input_path)
         
@@ -1127,6 +1128,8 @@ Exemplos de uso:
     # Opções
     parser.add_argument("--write_srt", action="store_true",
                        help="Gerar arquivo SRT com legendas")
+    parser.add_argument("--srt_only", action="store_true",
+                       help="Apenas gerar arquivo SRT e sair")
     
     args = parser.parse_args()
     
@@ -1195,6 +1198,33 @@ Exemplos de uso:
             media_info = load_media(args.input)
             original_duration = media_info["meta"]["duration"]
             editor.temp_files.append(media_info["audio_wav_path"])
+
+            # Modo somente-legenda: gerar SRT e sair (sem renderização de vídeo)
+            if args.srt_only:
+                logger.info("Modo somente-legenda: gerando SRT e finalizando")
+                vad_segments = run_vad(
+                    media_info["audio_wav_path"],
+                    media_info["sr"],
+                    config["vad_aggressiveness"],
+                    config["min_speech_ms"],
+                    config["min_gap_ms"],
+                    config["speech_padding_ms"]
+                )
+                sentences = transcribe_segments(
+                    media_info["audio_wav_path"],
+                    vad_segments,
+                    config["language"],
+                    config["whisper_model_size"],
+                    config["silence_split_ms"],
+                    True
+                )
+                if sentences:
+                    srt_path = os.path.splitext(args.output)[0] + ".srt"
+                    write_srt(sentences, srt_path)
+                    logger.info(f"Legendas salvas: {srt_path}")
+                else:
+                    logger.warning("Nenhum conteúdo transcrito; nada para salvar em SRT")
+                return 0
             
             # Modo áudio-apenas: pular VAD/transcrição
             if config["audio_only"]:
